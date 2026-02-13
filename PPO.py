@@ -392,10 +392,11 @@ class PerformanceEstimator:
 
 class Visualizer:
     """Initialize the visualizer with account data."""
-    def __init__(self, account_df, window_size=20):
+    def __init__(self, account_df, window_size=20, stock_name='SPY'):
         self.window_size = window_size
         self.valid_start = window_size - 1  # Valid data start index
         self.account = account_df.iloc[self.valid_start:]
+        self.stock_name = stock_name
     def draw_final(self):
         """Plot and save the equity curve."""
         plt.clf()
@@ -404,8 +405,8 @@ class Visualizer:
         plt.xlabel('Time Step')
         plt.ylabel('Capitals')
         plt.legend()
-        plt.savefig(f'{stock_name}/IXIC_PPO_Capitals.eps', format='eps', dpi=1000, bbox_inches='tight')
-        plt.savefig(f'{stock_name}/IXIC_PPO_Capitals.png', dpi=1000, bbox_inches='tight')
+        plt.savefig(f'{self.stock_name}/IXIC_PPO_Capitals.eps', format='eps', dpi=1000, bbox_inches='tight')
+        plt.savefig(f'{self.stock_name}/IXIC_PPO_Capitals.png', dpi=1000, bbox_inches='tight')
         plt.show()
 
     def draw(self):
@@ -419,12 +420,12 @@ class Visualizer:
         ax1.set_xlabel('Time Step')
         ax1.set_ylabel('Close Price')
         ax1.legend(loc='upper center', ncol=3, frameon=False)
-        plt.savefig(f'{stock_name}/IXIC_PPO_Actions.eps', format='eps', dpi=1000, bbox_inches='tight')
-        plt.savefig(f'{stock_name}/IXIC_PPO_Actions.png', dpi=1000, bbox_inches='tight')
+        plt.savefig(f'{self.stock_name}/IXIC_PPO_Actions.eps', format='eps', dpi=1000, bbox_inches='tight')
+        plt.savefig(f'{self.stock_name}/IXIC_PPO_Actions.png', dpi=1000, bbox_inches='tight')
         plt.show()
 
 # ==================== Training Pipeline ====================
-def train_with_validation(train_env, test_env, agent, num_episodes=800, test_interval=10):
+def train_with_validation(train_env, test_env, agent, num_episodes=800, test_interval=10, stock_name='SPY'):
     """Train the agent and periodically validate on the test environment."""
     history = {
         'train_returns': [],
@@ -452,10 +453,8 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
             transition_dict['dones'].append(float(done))
             state = next_state
             episode_return += reward
-        agent.update(transition_dict)
-        history['train_returns'].append(episode_return)
         
-        # Add debugging info
+        # Add debugging info (before update clears transition_dict)
         if (i_episode + 1) % 10 == 0:
             buy_count = sum(1 for a in transition_dict['actions'] if a == 1)
             sell_count = sum(1 for a in transition_dict['actions'] if a == 2)
@@ -465,6 +464,9 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
             print(f"  Sell actions: {sell_count}")
             print(f"  Avg reward: {avg_reward:.6f}")
             print(f"  Episode return: {episode_return:.6f}")
+        
+        agent.update(transition_dict)
+        history['train_returns'].append(episode_return)
 
         # Periodic validation
         if (i_episode + 1) >= test_interval:
@@ -491,7 +493,7 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
                 torch.save(agent.actor.state_dict(), '{}/PPO_Best_{}.pth'.format(stock_name, i_episode+1))
                 bestModelDir.append('{}/PPO_Best_{}.pth'.format(stock_name, i_episode+1))
                 test_env.account.to_csv(f'{stock_name}/best_account_ep{i_episode+1}_pnl{best_pnl:.0f}.csv', index=False)
-    dra = Visualizer(test_env.account, test_env.window_size)
+    dra = Visualizer(test_env.account, test_env.window_size, stock_name)
     dra.draw()
     train_env.account.to_csv(f'{stock_name}/train_account.csv', index=False)
     print(f'Training complete. Best test-set PnL: {best_pnl:.2f}')
@@ -514,7 +516,7 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
     return history, bestModelDir[-1]
 
 # ==================== Backtest Function ====================
-def backtest(model_path, env, greedy):
+def backtest(model_path, env, greedy, stock_name='SPY'):
     """Run backtest using a saved model and report metrics."""
     # Initialize PPO agent
     agent = PPO(state_dim=env.input_size * env.window_size,
@@ -548,7 +550,7 @@ def backtest(model_path, env, greedy):
     print(tabulate(perf_table, headers=['Metric', 'Value'], tablefmt='fancy_grid'))
     
     # Visualize results
-    visualizer = Visualizer(env.account, env.window_size)
+    visualizer = Visualizer(env.account, env.window_size, stock_name)
     visualizer.draw_final()
     visualizer.draw()
     
@@ -617,7 +619,7 @@ if __name__ == '__main__':
         # Start training
         env_test = TradingEnv(df_raw, test_startingDate, test_endingDate)
         env_test.init_market_data()    
-        history, BEST_MODEL_PATH = train_with_validation(env_train, env_test, agent, num_episodes, test_interval)
+        history, BEST_MODEL_PATH = train_with_validation(env_train, env_test, agent, num_episodes, test_interval, stock_name)
 
         # Plot training curves
         plt.figure(figsize=(12, 6))
@@ -630,4 +632,4 @@ if __name__ == '__main__':
 
         # ==================== Run Backtest ====================
         # Run backtest
-        account_df, performance = backtest(BEST_MODEL_PATH, env_test, greedy=True)
+        account_df, performance = backtest(BEST_MODEL_PATH, env_test, greedy=True, stock_name=stock_name)
