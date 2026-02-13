@@ -11,7 +11,7 @@ from datetime import datetime
 from tqdm import tqdm
 from tabulate import tabulate
 import warnings
-import talib
+# import talib  # Not used in this code
 from sklearn.ensemble import RandomForestRegressor
 import xgboost as xgb
 import shap
@@ -304,7 +304,7 @@ class PPO:
 # ==================== Performance Evaluation & Visualization ====================
 class PerformanceEstimator:
     """Performance Estimator class implementation."""
-    def __init__(self, account_df):
+    def __init__(self, account_df, window_size=20):
         self.window_size = window_size
         self.valid_start = window_size - 1  # Valid data start index
         self.account = account_df.iloc[self.valid_start:]
@@ -391,11 +391,11 @@ class PerformanceEstimator:
         return table
 
 class Visualizer:
-    def __init__(self, account_df):
+    """Initialize the visualizer with account data."""
+    def __init__(self, account_df, window_size=20):
         self.window_size = window_size
         self.valid_start = window_size - 1  # Valid data start index
         self.account = account_df.iloc[self.valid_start:]
-    """Initialize the visualizer with account data."""
     def draw_final(self):
         """Plot and save the equity curve."""
         plt.clf()
@@ -477,7 +477,7 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
                 state = next_state
 
             # Performance evaluation
-            est = PerformanceEstimator(test_env.account)
+            est = PerformanceEstimator(test_env.account, test_env.window_size)
             est.computePerformance()
             history['test_pnl'].append(est.PnL)
             history['test_returns'].append(est.CR)
@@ -491,7 +491,7 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
                 torch.save(agent.actor.state_dict(), '{}/PPO_Best_{}.pth'.format(stock_name, i_episode+1))
                 bestModelDir.append('{}/PPO_Best_{}.pth'.format(stock_name, i_episode+1))
                 test_env.account.to_csv(f'{stock_name}/best_account_ep{i_episode+1}_pnl{best_pnl:.0f}.csv', index=False)
-    dra = Visualizer(test_env.account)
+    dra = Visualizer(test_env.account, test_env.window_size)
     dra.draw()
     train_env.account.to_csv(f'{stock_name}/train_account.csv', index=False)
     print(f'Training complete. Best test-set PnL: {best_pnl:.2f}')
@@ -541,14 +541,14 @@ def backtest(model_path, env, greedy):
         state = next_state
     
     # Performance evaluation
-    estimator = PerformanceEstimator(env.account)
+    estimator = PerformanceEstimator(env.account, env.window_size)
     estimator.computePerformance()
     perf_table = estimator.computePerformance()
     print("\n" + "="*40 + " Backtest Results " + "="*40)
     print(tabulate(perf_table, headers=['Metric', 'Value'], tablefmt='fancy_grid'))
     
     # Visualize results
-    visualizer = Visualizer(env.account)
+    visualizer = Visualizer(env.account, env.window_size)
     visualizer.draw_final()
     visualizer.draw()
     
