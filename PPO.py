@@ -165,22 +165,26 @@ class TradingEnv:
         else: # No operation
             self.account.loc[self.t, 'Q_Action'] = 0
             self.riskControl()
-        # Compute reward
-        # Use Sharpe ratio as reward
-        chg = []
-        for i in range(5):
-            chg.append((self.trend[self.t + i + 1] - self.trend[self.t])/self.trend[self.t])
-        reward = np.mean(chg)/(np.std(chg)+ 1e-6)
-        if self.account.loc[self.t, 'Position']==1:
-            self.reward = reward
-        else:
-            self.reward = 0
         
         # Update account information
         self.account.loc[self.t, 'Holdings'] = self.account.loc[self.t, 'Position']*self.holdingNum*self.account.loc[self.t, 'Close']
         self.account.loc[self.t, 'Capitals'] = self.account.loc[self.t, 'Cash'] + self.account.loc[self.t, 'Holdings']
         # Compute return rate
         self.account.loc[self.t, 'Returns'] = (self.account.loc[self.t, 'Capitals']- self.account.loc[self.t-1, 'Capitals'])/self.account.loc[self.t-1, 'Capitals']
+        
+        # Compute reward - use immediate portfolio return
+        current_capital = self.account.loc[self.t, 'Cash'] + \
+                          self.holdingNum * self.account.loc[self.t, 'Close']
+        prev_capital = self.account.loc[self.t-1, 'Capitals']
+        
+        # Reward = portfolio return (percentage change)
+        portfolio_return = (current_capital - prev_capital) / prev_capital
+        
+        # Add small penalty for inaction to encourage exploration
+        if action == 0:
+            self.reward = portfolio_return - 0.0001
+        else:
+            self.reward = portfolio_return
 
         # Update time step
         self.t += 1
@@ -227,6 +231,10 @@ def compute_advantage(gamma, lmbda, td_delta, device):
         advantage = delta + gamma * lmbda * advantage
         advantages.append(advantage)
     advantages = torch.tensor(advantages[::-1], dtype=torch.float, device=device)
+    
+    # Normalize advantages
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    
     return advantages.view(-1, 1)
 
 class PPO:
@@ -278,8 +286,12 @@ class PPO:
             surr1 = ratio * advantage
             surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * advantage
             
+            # Add entropy bonus for exploration
+            probs = self.actor(states)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1, keepdim=True)
+            entropy_bonus = 0.01 * entropy
 
-            actor_loss = torch.mean(-torch.min(surr1, surr2))
+            actor_loss = torch.mean(-torch.min(surr1, surr2) - entropy_bonus)
             critic_loss = torch.mean(F.mse_loss(self.critic(states), td_target.detach()))
             self.actor_optimizer.zero_grad()
             self.critic_optimizer.zero_grad()
@@ -442,6 +454,17 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
             episode_return += reward
         agent.update(transition_dict)
         history['train_returns'].append(episode_return)
+        
+        # Add debugging info
+        if (i_episode + 1) % 10 == 0:
+            buy_count = sum(1 for a in transition_dict['actions'] if a == 1)
+            sell_count = sum(1 for a in transition_dict['actions'] if a == 2)
+            avg_reward = np.mean(transition_dict['rewards']) if transition_dict['rewards'] else 0
+            print(f"\nEpisode {i_episode+1} Training Stats:")
+            print(f"  Buy actions: {buy_count}")
+            print(f"  Sell actions: {sell_count}")
+            print(f"  Avg reward: {avg_reward:.6f}")
+            print(f"  Episode return: {episode_return:.6f}")
 
         # Periodic validation
         if (i_episode + 1) >= test_interval:
@@ -564,12 +587,12 @@ if __name__ == '__main__':
 
         # Hyperparameter setup
         hidden_dim = 64  # Neural network hidden dimension
-        actor_lr = 1e-4  # Policy network learning rate
+        actor_lr = 3e-4  # Policy network learning rate (increased from 1e-4)
         critic_lr = 1e-3 # Value network learning rate
         lmbda = 0.95 # GAE parameter
         epochs = 4 # PPO update epochs
-        eps = 0.2 # PPO clipping range
-        gamma = 0.95 # Discount factor
+        eps = 0.1 # PPO clipping range (reduced from 0.2)
+        gamma = 0.99 # Discount factor (increased from 0.95)
         test_interval = 5 # Initial test interval
         window_size = 20
         num_episodes = 100
