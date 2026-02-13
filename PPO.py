@@ -11,7 +11,7 @@ from datetime import datetime
 from tqdm import tqdm
 from tabulate import tabulate
 import warnings
-import talib
+# import talib  # Not used in this code
 from sklearn.ensemble import RandomForestRegressor
 import xgboost as xgb
 import shap
@@ -165,22 +165,26 @@ class TradingEnv:
         else: # No operation
             self.account.loc[self.t, 'Q_Action'] = 0
             self.riskControl()
-        # Compute reward
-        # Use Sharpe ratio as reward
-        chg = []
-        for i in range(5):
-            chg.append((self.trend[self.t + i + 1] - self.trend[self.t])/self.trend[self.t])
-        reward = np.mean(chg)/(np.std(chg)+ 1e-6)
-        if self.account.loc[self.t, 'Position']==1:
-            self.reward = reward
-        else:
-            self.reward = 0
         
         # Update account information
         self.account.loc[self.t, 'Holdings'] = self.account.loc[self.t, 'Position']*self.holdingNum*self.account.loc[self.t, 'Close']
         self.account.loc[self.t, 'Capitals'] = self.account.loc[self.t, 'Cash'] + self.account.loc[self.t, 'Holdings']
         # Compute return rate
         self.account.loc[self.t, 'Returns'] = (self.account.loc[self.t, 'Capitals']- self.account.loc[self.t-1, 'Capitals'])/self.account.loc[self.t-1, 'Capitals']
+        
+        # Compute reward - use immediate portfolio return
+        current_capital = self.account.loc[self.t, 'Cash'] + \
+                          self.holdingNum * self.account.loc[self.t, 'Close']
+        prev_capital = self.account.loc[self.t-1, 'Capitals']
+        
+        # Reward = portfolio return (percentage change)
+        portfolio_return = (current_capital - prev_capital) / prev_capital
+        
+        # Add small penalty for inaction to encourage exploration
+        if action == 0:
+            self.reward = portfolio_return - 0.0001
+        else:
+            self.reward = portfolio_return
 
         # Update time step
         self.t += 1
@@ -227,6 +231,10 @@ def compute_advantage(gamma, lmbda, td_delta, device):
         advantage = delta + gamma * lmbda * advantage
         advantages.append(advantage)
     advantages = torch.tensor(advantages[::-1], dtype=torch.float, device=device)
+    
+    # Normalize advantages
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    
     return advantages.view(-1, 1)
 
 class PPO:
@@ -278,8 +286,12 @@ class PPO:
             surr1 = ratio * advantage
             surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * advantage
             
+            # Add entropy bonus for exploration
+            probs = self.actor(states)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1, keepdim=True)
+            entropy_bonus = 0.01 * entropy
 
-            actor_loss = torch.mean(-torch.min(surr1, surr2))
+            actor_loss = torch.mean(-torch.min(surr1, surr2) - entropy_bonus)
             critic_loss = torch.mean(F.mse_loss(self.critic(states), td_target.detach()))
             self.actor_optimizer.zero_grad()
             self.critic_optimizer.zero_grad()
@@ -292,7 +304,7 @@ class PPO:
 # ==================== Performance Evaluation & Visualization ====================
 class PerformanceEstimator:
     """Performance Estimator class implementation."""
-    def __init__(self, account_df):
+    def __init__(self, account_df, window_size=20):
         self.window_size = window_size
         self.valid_start = window_size - 1  # Valid data start index
         self.account = account_df.iloc[self.valid_start:]
@@ -379,11 +391,12 @@ class PerformanceEstimator:
         return table
 
 class Visualizer:
-    def __init__(self, account_df):
+    """Initialize the visualizer with account data."""
+    def __init__(self, account_df, window_size=20, stock_name='SPY'):
         self.window_size = window_size
         self.valid_start = window_size - 1  # Valid data start index
         self.account = account_df.iloc[self.valid_start:]
-    """Initialize the visualizer with account data."""
+        self.stock_name = stock_name
     def draw_final(self):
         """Plot and save the equity curve."""
         plt.clf()
@@ -392,8 +405,8 @@ class Visualizer:
         plt.xlabel('Time Step')
         plt.ylabel('Capitals')
         plt.legend()
-        plt.savefig(f'{stock_name}/IXIC_PPO_Capitals.eps', format='eps', dpi=1000, bbox_inches='tight')
-        plt.savefig(f'{stock_name}/IXIC_PPO_Capitals.png', dpi=1000, bbox_inches='tight')
+        plt.savefig(f'{self.stock_name}/IXIC_PPO_Capitals.eps', format='eps', dpi=1000, bbox_inches='tight')
+        plt.savefig(f'{self.stock_name}/IXIC_PPO_Capitals.png', dpi=1000, bbox_inches='tight')
         plt.show()
 
     def draw(self):
@@ -407,12 +420,12 @@ class Visualizer:
         ax1.set_xlabel('Time Step')
         ax1.set_ylabel('Close Price')
         ax1.legend(loc='upper center', ncol=3, frameon=False)
-        plt.savefig(f'{stock_name}/IXIC_PPO_Actions.eps', format='eps', dpi=1000, bbox_inches='tight')
-        plt.savefig(f'{stock_name}/IXIC_PPO_Actions.png', dpi=1000, bbox_inches='tight')
+        plt.savefig(f'{self.stock_name}/IXIC_PPO_Actions.eps', format='eps', dpi=1000, bbox_inches='tight')
+        plt.savefig(f'{self.stock_name}/IXIC_PPO_Actions.png', dpi=1000, bbox_inches='tight')
         plt.show()
 
 # ==================== Training Pipeline ====================
-def train_with_validation(train_env, test_env, agent, num_episodes=800, test_interval=10):
+def train_with_validation(train_env, test_env, agent, num_episodes=800, test_interval=10, stock_name='SPY'):
     """Train the agent and periodically validate on the test environment."""
     history = {
         'train_returns': [],
@@ -440,6 +453,18 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
             transition_dict['dones'].append(float(done))
             state = next_state
             episode_return += reward
+        
+        # Add debugging info (before update clears transition_dict)
+        if (i_episode + 1) % 10 == 0:
+            buy_count = sum(1 for a in transition_dict['actions'] if a == 1)
+            sell_count = sum(1 for a in transition_dict['actions'] if a == 2)
+            avg_reward = np.mean(transition_dict['rewards']) if transition_dict['rewards'] else 0
+            print(f"\nEpisode {i_episode+1} Training Stats:")
+            print(f"  Buy actions: {buy_count}")
+            print(f"  Sell actions: {sell_count}")
+            print(f"  Avg reward: {avg_reward:.6f}")
+            print(f"  Episode return: {episode_return:.6f}")
+        
         agent.update(transition_dict)
         history['train_returns'].append(episode_return)
 
@@ -454,7 +479,7 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
                 state = next_state
 
             # Performance evaluation
-            est = PerformanceEstimator(test_env.account)
+            est = PerformanceEstimator(test_env.account, test_env.window_size)
             est.computePerformance()
             history['test_pnl'].append(est.PnL)
             history['test_returns'].append(est.CR)
@@ -468,7 +493,7 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
                 torch.save(agent.actor.state_dict(), '{}/PPO_Best_{}.pth'.format(stock_name, i_episode+1))
                 bestModelDir.append('{}/PPO_Best_{}.pth'.format(stock_name, i_episode+1))
                 test_env.account.to_csv(f'{stock_name}/best_account_ep{i_episode+1}_pnl{best_pnl:.0f}.csv', index=False)
-    dra = Visualizer(test_env.account)
+    dra = Visualizer(test_env.account, test_env.window_size, stock_name)
     dra.draw()
     train_env.account.to_csv(f'{stock_name}/train_account.csv', index=False)
     print(f'Training complete. Best test-set PnL: {best_pnl:.2f}')
@@ -491,7 +516,7 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
     return history, bestModelDir[-1]
 
 # ==================== Backtest Function ====================
-def backtest(model_path, env, greedy):
+def backtest(model_path, env, greedy, stock_name='SPY'):
     """Run backtest using a saved model and report metrics."""
     # Initialize PPO agent
     agent = PPO(state_dim=env.input_size * env.window_size,
@@ -518,14 +543,14 @@ def backtest(model_path, env, greedy):
         state = next_state
     
     # Performance evaluation
-    estimator = PerformanceEstimator(env.account)
+    estimator = PerformanceEstimator(env.account, env.window_size)
     estimator.computePerformance()
     perf_table = estimator.computePerformance()
     print("\n" + "="*40 + " Backtest Results " + "="*40)
     print(tabulate(perf_table, headers=['Metric', 'Value'], tablefmt='fancy_grid'))
     
     # Visualize results
-    visualizer = Visualizer(env.account)
+    visualizer = Visualizer(env.account, env.window_size, stock_name)
     visualizer.draw_final()
     visualizer.draw()
     
@@ -564,12 +589,12 @@ if __name__ == '__main__':
 
         # Hyperparameter setup
         hidden_dim = 64  # Neural network hidden dimension
-        actor_lr = 1e-4  # Policy network learning rate
+        actor_lr = 3e-4  # Policy network learning rate (increased from 1e-4)
         critic_lr = 1e-3 # Value network learning rate
         lmbda = 0.95 # GAE parameter
         epochs = 4 # PPO update epochs
-        eps = 0.2 # PPO clipping range
-        gamma = 0.95 # Discount factor
+        eps = 0.1 # PPO clipping range (reduced from 0.2)
+        gamma = 0.99 # Discount factor (increased from 0.95)
         test_interval = 5 # Initial test interval
         window_size = 20
         num_episodes = 100
@@ -594,7 +619,7 @@ if __name__ == '__main__':
         # Start training
         env_test = TradingEnv(df_raw, test_startingDate, test_endingDate)
         env_test.init_market_data()    
-        history, BEST_MODEL_PATH = train_with_validation(env_train, env_test, agent, num_episodes, test_interval)
+        history, BEST_MODEL_PATH = train_with_validation(env_train, env_test, agent, num_episodes, test_interval, stock_name)
 
         # Plot training curves
         plt.figure(figsize=(12, 6))
@@ -607,4 +632,4 @@ if __name__ == '__main__':
 
         # ==================== Run Backtest ====================
         # Run backtest
-        account_df, performance = backtest(BEST_MODEL_PATH, env_test, greedy=True)
+        account_df, performance = backtest(BEST_MODEL_PATH, env_test, greedy=True, stock_name=stock_name)
