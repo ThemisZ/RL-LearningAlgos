@@ -1,0 +1,2 @@
+PnL,Cummulated Return,Annualized Return,Annualized Volatility,Sharpe Ratio,Sortino Ratio,Max Drawdown,Max DD Duration,model_name,stock_name
+112561,22.58%,20.70%,12.86%,1.510,2.016,8.40%,14 days,PPO,SPY

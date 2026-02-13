@@ -1,0 +1,10 @@
+pandas
+numpy
+matplotlib
+torch
+tqdm
+tabulate
+TA-Lib
+scikit-learn
+xgboost
+shap
