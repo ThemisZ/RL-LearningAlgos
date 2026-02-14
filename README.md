@@ -1,5 +1,5 @@
 # A-Comparative-Study-of-Policy-Based-Reinforcement-Learning-Algorithms
-A Comparative Study of Policy-Based Reinforcement Learning Algorithms for Chinese Single-Stock Trading
+A Comparative Study of Policy-Based Reinforcement Learning Algorithms for any asset trading
 
 ## Streamlit UI + MLflow Tracking
 
