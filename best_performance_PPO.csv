@@ -1,2 +1,9 @@
 PnL,Cummulated Return,Annualized Return,Annualized Volatility,Sharpe Ratio,Sortino Ratio,Max Drawdown,Max DD Duration,model_name,stock_name
 112561,22.58%,20.70%,12.86%,1.510,2.016,8.40%,14 days,PPO,SPY
+121188,24.24%,22.21%,12.75%,1.641,2.189,8.40%,14 days,PPO,SPY
+-32554,-6.51%,-6.03%,12.21%,-0.450,-0.618,10.54%,73 days,PPO,SPY
+121188,24.24%,22.21%,12.75%,1.641,2.189,8.40%,14 days,PPO,SPY
+121188,24.24%,22.21%,12.75%,1.641,2.189,8.40%,14 days,PPO,SPY
+121188,24.24%,22.21%,12.75%,1.641,2.189,8.40%,14 days,PPO,SPY
+-32554,-6.51%,-6.03%,12.21%,-0.450,-0.618,10.54%,73 days,PPO,SPY
+121188,24.24%,22.21%,12.75%,1.641,2.189,8.40%,14 days,PPO,SPY

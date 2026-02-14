@@ -425,7 +425,7 @@ class Visualizer:
         plt.show()
 
 # ==================== Training Pipeline ====================
-def train_with_validation(train_env, test_env, agent, num_episodes=800, test_interval=10, stock_name='SPY'):
+def train_with_validation(train_env, test_env, agent, num_episodes=800, test_interval=10, stock_name='SPY', draw_plots=True):
     """Train the agent and periodically validate on the test environment."""
     history = {
         'train_returns': [],
@@ -493,8 +493,9 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
                 torch.save(agent.actor.state_dict(), '{}/PPO_Best_{}.pth'.format(stock_name, i_episode+1))
                 bestModelDir.append('{}/PPO_Best_{}.pth'.format(stock_name, i_episode+1))
                 test_env.account.to_csv(f'{stock_name}/best_account_ep{i_episode+1}_pnl{best_pnl:.0f}.csv', index=False)
-    dra = Visualizer(test_env.account, test_env.window_size, stock_name)
-    dra.draw()
+    if draw_plots:
+        dra = Visualizer(test_env.account, test_env.window_size, stock_name)
+        dra.draw()
     train_env.account.to_csv(f'{stock_name}/train_account.csv', index=False)
     print(f'Training complete. Best test-set PnL: {best_pnl:.2f}')
     print("\n" + "="*40 + " Validation Backtest Results " + "="*40)
@@ -513,10 +514,24 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
         df1.to_csv(save_csv_name, index=False, mode='a', header=False)
     else:
         df1.to_csv(save_csv_name, index=False)
-    return history, bestModelDir[-1]
+    return history, bestModelDir[-1], performance_dict
 
 # ==================== Backtest Function ====================
-def backtest(model_path, env, greedy, stock_name='SPY'):
+def backtest(
+    model_path,
+    env,
+    greedy,
+    hidden_dim,
+    actor_lr,
+    critic_lr,
+    lmbda,
+    epochs,
+    eps,
+    gamma,
+    device,
+    stock_name='SPY',
+    visualize=True
+):
     """Run backtest using a saved model and report metrics."""
     # Initialize PPO agent
     agent = PPO(state_dim=env.input_size * env.window_size,
@@ -550,9 +565,10 @@ def backtest(model_path, env, greedy, stock_name='SPY'):
     print(tabulate(perf_table, headers=['Metric', 'Value'], tablefmt='fancy_grid'))
     
     # Visualize results
-    visualizer = Visualizer(env.account, env.window_size, stock_name)
-    visualizer.draw_final()
-    visualizer.draw()
+    if visualize:
+        visualizer = Visualizer(env.account, env.window_size, stock_name)
+        visualizer.draw_final()
+        visualizer.draw()
     
     # Save detailed trade records
     env.account.to_csv(f'{stock_name}/backtest_results.csv', index=False)
@@ -565,71 +581,206 @@ def backtest(model_path, env, greedy, stock_name='SPY'):
     
     return env.account, perf_table
     
+def run_ppo_experiment(
+    stock_name='SPY',
+    data_file_path=None,
+    train_start='2012-01-01',
+    train_end='2023-12-31',
+    test_start='2024-01-01',
+    test_end='2025-03-31',
+    init_money=500000,
+    hidden_dim=64,
+    actor_lr=3e-4,
+    critic_lr=1e-3,
+    lmbda=0.95,
+    epochs=4,
+    eps=0.1,
+    gamma=0.99,
+    test_interval=5,
+    num_episodes=100,
+    seed=1,
+    use_mlflow=False,
+    mlflow_tracking_uri='sqlite:///mlflow.db',
+    mlflow_experiment='rl-learningalgos',
+    draw_plots=True
+):
+    setup_seed(seed)
+    data_path = data_file_path or f'Data/{stock_name}.csv'
+    df_raw = pd.read_csv(data_path)
+    df_raw = df_raw.dropna()
+    if 'Adj Close' in df_raw.columns:
+        df_raw = df_raw.drop(['Adj Close'], axis=1)
+
+    if not os.path.exists(stock_name):
+        os.mkdir(stock_name)
+
+    train_startingDate = datetime.strptime(train_start, '%Y-%m-%d')
+    train_endingDate = datetime.strptime(train_end, '%Y-%m-%d')
+    test_startingDate = datetime.strptime(test_start, '%Y-%m-%d')
+    test_endingDate = datetime.strptime(test_end, '%Y-%m-%d')
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    env_train = TradingEnv(df_raw, train_startingDate, train_endingDate, init_money=init_money)
+    env_train.init_market_data()
+    env_test = TradingEnv(df_raw, test_startingDate, test_endingDate, init_money=init_money)
+    env_test.init_market_data()
+
+    agent = PPO(
+        state_dim=env_train.input_size * env_train.window_size,
+        hidden_dim=hidden_dim,
+        action_dim=env_train.n_actions,
+        actor_lr=actor_lr,
+        critic_lr=critic_lr,
+        lmbda=lmbda,
+        epochs=epochs,
+        eps=eps,
+        gamma=gamma,
+        device=device
+    )
+
+    mlflow_run = None
+    mlflow_client = None
+    if use_mlflow:
+        try:
+            import mlflow
+            mlflow.set_tracking_uri(mlflow_tracking_uri)
+            mlflow.set_experiment(mlflow_experiment)
+            mlflow_client = mlflow
+            mlflow_run = mlflow.start_run(run_name=f'PPO_{stock_name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+            mlflow.log_params({
+                'strategy': 'PPO',
+                'stock_name': stock_name,
+                'data_path': data_path,
+                'train_start': train_start,
+                'train_end': train_end,
+                'test_start': test_start,
+                'test_end': test_end,
+                'init_money': init_money,
+                'hidden_dim': hidden_dim,
+                'actor_lr': actor_lr,
+                'critic_lr': critic_lr,
+                'lmbda': lmbda,
+                'epochs': epochs,
+                'eps': eps,
+                'gamma': gamma,
+                'test_interval': test_interval,
+                'num_episodes': num_episodes,
+                'seed': seed,
+                'device': str(device)
+            })
+        except Exception as exc:
+            print(f'[WARN] MLflow initialization failed: {exc}')
+
+    try:
+        history, best_model_path, best_perf_dict = train_with_validation(
+            env_train,
+            env_test,
+            agent,
+            num_episodes=num_episodes,
+            test_interval=test_interval,
+            stock_name=stock_name,
+            draw_plots=draw_plots
+        )
+
+        account_df, performance = backtest(
+            best_model_path,
+            env_test,
+            greedy=True,
+            hidden_dim=hidden_dim,
+            actor_lr=actor_lr,
+            critic_lr=critic_lr,
+            lmbda=lmbda,
+            epochs=epochs,
+            eps=eps,
+            gamma=gamma,
+            device=device,
+            stock_name=stock_name,
+            visualize=draw_plots
+        )
+
+        if mlflow_client is not None:
+            mlflow_client.log_metrics({
+                'best_pnl': float(best_perf_dict.get('PnL', 0)),
+                'best_cum_return_pct': float(str(best_perf_dict.get('Cummulated Return', '0')).replace('%', '')),
+                'best_annualized_return_pct': float(str(best_perf_dict.get('Annualized Return', '0')).replace('%', '')),
+                'best_annualized_volatility_pct': float(str(best_perf_dict.get('Annualized Volatility', '0')).replace('%', '')),
+                'best_sharpe_ratio': float(best_perf_dict.get('Sharpe Ratio', 0)),
+                'best_sortino_ratio': float(best_perf_dict.get('Sortino Ratio', 0)),
+                'best_max_drawdown_pct': float(str(best_perf_dict.get('Max Drawdown', '0')).replace('%', '')),
+            })
+            mlflow_client.log_artifact(best_model_path)
+            mlflow_client.log_artifact(f'{stock_name}/train_account.csv')
+            mlflow_client.log_artifact(f'{stock_name}/backtest_results.csv')
+
+        return {
+            'stock_name': stock_name,
+            'data_path': data_path,
+            'best_model_path': best_model_path,
+            'history': history,
+            'backtest_account': account_df,
+            'performance_table': performance,
+            'best_performance': best_perf_dict
+        }
+    finally:
+        if mlflow_run is not None:
+            try:
+                mlflow_client.end_run()
+            except Exception:
+                pass
+
+
+def _build_arg_parser():
+    parser = argparse.ArgumentParser(description='PPO stock trading')
+    parser.add_argument('--stocks', default='SPY', help='Stock ticker name used for output folder naming')
+    parser.add_argument('--data_path', default='', help='Path to stock CSV. If empty, Data/{stocks}.csv is used')
+    parser.add_argument('--train_start', default='2012-01-01')
+    parser.add_argument('--train_end', default='2023-12-31')
+    parser.add_argument('--test_start', default='2024-01-01')
+    parser.add_argument('--test_end', default='2025-03-31')
+    parser.add_argument('--init_money', type=float, default=500000)
+    parser.add_argument('--hidden_dim', type=int, default=64)
+    parser.add_argument('--actor_lr', type=float, default=3e-4)
+    parser.add_argument('--critic_lr', type=float, default=1e-3)
+    parser.add_argument('--lmbda', type=float, default=0.95)
+    parser.add_argument('--epochs', type=int, default=4)
+    parser.add_argument('--eps', type=float, default=0.1)
+    parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--test_interval', type=int, default=5)
+    parser.add_argument('--num_episodes', type=int, default=100)
+    parser.add_argument('--seed', type=int, default=1)
+    parser.add_argument('--use_mlflow', action='store_true', help='Enable MLflow tracking')
+    parser.add_argument('--mlflow_uri', default='sqlite:///mlflow.db', help='MLflow tracking URI')
+    parser.add_argument('--mlflow_experiment', default='rl-learningalgos', help='MLflow experiment name')
+    parser.add_argument('--no_plots', action='store_true', help='Disable matplotlib display and plotting')
+    return parser
+
+
 # ==================== Main Program ====================
 if __name__ == '__main__':
-    setup_seed(1)
-    parser = argparse.ArgumentParser(description='Stock analysis program')
-    parser.add_argument('--stocks', default='002230', help='Stock ticker list')
-    args = parser.parse_args()    
-    stock_list = [args.stocks]
-    for stock_name in stock_list:
-        file_path = f'Data/{stock_name}.csv'  # Stock historical data
-        df_raw = pd.read_csv(file_path)
-        df_raw = df_raw.dropna()  # Drop missing values
-        if 'Adj Close' in df_raw.columns:
-            df_raw = df_raw.drop(['Adj Close'], axis=1)  # Remove adjusted close column
-        if not os.path.exists(stock_name):
-            os.mkdir(stock_name) 
-        # Set train/test date ranges
-        train_startingDate = datetime.strptime('2012-01-01', '%Y-%m-%d')
-        train_endingDate   = datetime.strptime('2023-12-31', '%Y-%m-%d')
+    parser = _build_arg_parser()
+    args = parser.parse_args()
 
-        test_startingDate  = datetime.strptime('2024-01-01', '%Y-%m-%d')
-        test_endingDate    = datetime.strptime('2025-03-31', '%Y-%m-%d')
-
-        # Hyperparameter setup
-        hidden_dim = 64  # Neural network hidden dimension
-        actor_lr = 3e-4  # Policy network learning rate (increased from 1e-4)
-        critic_lr = 1e-3 # Value network learning rate
-        lmbda = 0.95 # GAE parameter
-        epochs = 4 # PPO update epochs
-        eps = 0.1 # PPO clipping range (reduced from 0.2)
-        gamma = 0.99 # Discount factor (increased from 0.95)
-        test_interval = 5 # Initial test interval
-        window_size = 20
-        num_episodes = 100
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # Device selection
-
-        # Initialize environment
-        env_train = TradingEnv(df_raw, train_startingDate, train_endingDate)
-        env_train.init_market_data()
-
-        # Initialize PPO agent
-        agent = PPO(state_dim=env_train.input_size * env_train.window_size,
-                    hidden_dim=hidden_dim,
-                    action_dim=env_train.n_actions,
-                    actor_lr=actor_lr,
-                    critic_lr=critic_lr,
-                    lmbda=lmbda,
-                    epochs=epochs,
-                    eps=eps,
-                    gamma=gamma,
-                    device=device)
-
-        # Start training
-        env_test = TradingEnv(df_raw, test_startingDate, test_endingDate)
-        env_test.init_market_data()    
-        history, BEST_MODEL_PATH = train_with_validation(env_train, env_test, agent, num_episodes, test_interval, stock_name)
-
-        # Plot training curves
-        plt.figure(figsize=(12, 6))
-        plt.subplot(2, 1, 1)
-        plt.plot(history['train_returns'], label='Train Return')
-        plt.title('Training Episode Returns')
-        plt.legend()
-        plt.show()
-        # BEST_MODEL_PATH = 'PPO_Best_18.pth'
-
-        # ==================== Run Backtest ====================
-        # Run backtest
-        account_df, performance = backtest(BEST_MODEL_PATH, env_test, greedy=True, stock_name=stock_name)
+    run_ppo_experiment(
+        stock_name=args.stocks,
+        data_file_path=args.data_path if args.data_path else None,
+        train_start=args.train_start,
+        train_end=args.train_end,
+        test_start=args.test_start,
+        test_end=args.test_end,
+        init_money=args.init_money,
+        hidden_dim=args.hidden_dim,
+        actor_lr=args.actor_lr,
+        critic_lr=args.critic_lr,
+        lmbda=args.lmbda,
+        epochs=args.epochs,
+        eps=args.eps,
+        gamma=args.gamma,
+        test_interval=args.test_interval,
+        num_episodes=args.num_episodes,
+        seed=args.seed,
+        use_mlflow=args.use_mlflow,
+        mlflow_tracking_uri=args.mlflow_uri,
+        mlflow_experiment=args.mlflow_experiment,
+        draw_plots=not args.no_plots
+    )

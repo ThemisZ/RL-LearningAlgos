@@ -8,6 +8,18 @@ __pycache__/
 venv/
 env/
 ENV/
+rl_env/
+
+# Experiment tracking
+mlruns/
+mlflow.db
+
+# Training/backtest outputs
+best_performance_PPO.csv
+SPY/backtest_results.csv
+SPY/train_account.csv
+SPY/best_account_*.csv
+SPY/PPO_Best_*.pth
 
 # IDE
 .vscode/

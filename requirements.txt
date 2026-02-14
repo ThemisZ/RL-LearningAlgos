@@ -8,3 +8,5 @@ TA-Lib
 scikit-learn
 xgboost
 shap
+streamlit
+mlflow
