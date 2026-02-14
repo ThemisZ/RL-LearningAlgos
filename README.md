@@ -1,5 +1,4 @@
-# A-Comparative-Study-of-Policy-Based-Reinforcement-Learning-Algorithms
-A Comparative Study of Policy-Based Reinforcement Learning Algorithms for any asset trading
+# Study-of-Policy-Based-Reinforcement-Learning-Algos
 
 ## Streamlit UI + MLflow Tracking
 
