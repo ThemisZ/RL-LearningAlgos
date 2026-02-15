@@ -4,11 +4,30 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from PPO import run_ppo_experiment
+from PPO import AVAILABLE_FEATURES, DEFAULT_FEATURES, run_ppo_experiment
 
 
 st.set_page_config(page_title="RL Strategy Runner", layout="wide")
 st.title("RL Strategy Runner")
+
+if "selected_features" not in st.session_state:
+    st.session_state["selected_features"] = DEFAULT_FEATURES.copy()
+
+run_tab, features_tab = st.tabs(["Run", "Features"])
+
+with features_tab:
+    st.subheader("Available features")
+    features_df = pd.DataFrame(
+        [{"Feature": feature, "Description": desc} for feature, desc in AVAILABLE_FEATURES.items()]
+    )
+    st.dataframe(features_df, width='stretch')
+    selected_features = st.multiselect(
+        "Select PPO input features",
+        options=list(AVAILABLE_FEATURES.keys()),
+        default=st.session_state["selected_features"],
+    )
+    st.session_state["selected_features"] = selected_features
+    st.caption(f"Selected {len(selected_features)} feature(s): {', '.join(selected_features) if selected_features else 'None'}")
 
 
 def _list_data_files(data_dir: Path):
@@ -69,97 +88,136 @@ with st.sidebar:
     use_mlflow = st.checkbox("Enable MLflow", value=True)
     mlflow_uri = st.text_input("MLflow URI", value="sqlite:///mlflow.db")
     mlflow_experiment = st.text_input("MLflow experiment", value="rl-learningalgos")
+    keep_results = st.checkbox("Keep existing result files", value=False)
+
+    st.subheader("Selected features")
+    st.write(st.session_state["selected_features"])
 
     run_clicked = st.button("Run train + backtest", type="primary", use_container_width=True)
 
-if strategy != "PPO":
-    st.warning("Only PPO is currently implemented.")
+with run_tab:
+    if strategy != "PPO":
+        st.warning("Only PPO is currently implemented.")
 
-if run_clicked:
-    selected_data_path = custom_data_path.strip() or data_path
-    if not selected_data_path:
-        st.error("No data source selected. Add a file under Data/ or provide custom path.")
-        st.stop()
-
-    if not os.path.exists(selected_data_path):
-        st.error(f"Data file not found: {selected_data_path}")
-        st.stop()
-
-    with st.spinner("Training and backtesting... this can take a while"):
-        try:
-            results = run_ppo_experiment(
-                stock_name=stock_name,
-                data_file_path=selected_data_path,
-                train_start=train_start,
-                train_end=train_end,
-                test_start=test_start,
-                test_end=test_end,
-                init_money=float(init_money),
-                hidden_dim=int(hidden_dim),
-                actor_lr=float(actor_lr),
-                critic_lr=float(critic_lr),
-                lmbda=float(lmbda),
-                epochs=int(epochs),
-                eps=float(eps),
-                gamma=float(gamma),
-                test_interval=int(test_interval),
-                num_episodes=int(num_episodes),
-                seed=int(seed),
-                use_mlflow=bool(use_mlflow),
-                mlflow_tracking_uri=mlflow_uri,
-                mlflow_experiment=mlflow_experiment,
-                draw_plots=False,
-            )
-        except Exception as exc:
-            st.exception(exc)
+    if run_clicked:
+        selected_data_path = custom_data_path.strip() or data_path
+        if not selected_data_path:
+            st.error("No data source selected. Add a file under Data/ or provide custom path.")
             st.stop()
 
-    st.success("Run completed")
+        if not os.path.exists(selected_data_path):
+            st.error(f"Data file not found: {selected_data_path}")
+            st.stop()
 
-    st.subheader("Run summary")
-    st.write({
-        "strategy": strategy,
-        "stock_name": results["stock_name"],
-        "data_path": results["data_path"],
-        "best_model_path": results["best_model_path"],
-    })
+        if not st.session_state["selected_features"]:
+            st.error("Select at least one feature in the Features tab before running.")
+            st.stop()
 
-    perf = results.get("best_performance", {})
-    if perf:
-        st.subheader("Best validation metrics")
-        metric_cols = st.columns(min(4, len(perf)))
-        for idx, (k, v) in enumerate(perf.items()):
-            metric_cols[idx % len(metric_cols)].metric(k, _safe_metric_value(v))
+        with st.spinner("Training and backtesting... this can take a while"):
+            try:
+                results = run_ppo_experiment(
+                    stock_name=stock_name,
+                    data_file_path=selected_data_path,
+                    train_start=train_start,
+                    train_end=train_end,
+                    test_start=test_start,
+                    test_end=test_end,
+                    init_money=float(init_money),
+                    hidden_dim=int(hidden_dim),
+                    actor_lr=float(actor_lr),
+                    critic_lr=float(critic_lr),
+                    lmbda=float(lmbda),
+                    epochs=int(epochs),
+                    eps=float(eps),
+                    gamma=float(gamma),
+                    test_interval=int(test_interval),
+                    num_episodes=int(num_episodes),
+                    seed=int(seed),
+                    use_mlflow=bool(use_mlflow),
+                    mlflow_tracking_uri=mlflow_uri,
+                    mlflow_experiment=mlflow_experiment,
+                    draw_plots=False,
+                    clean_output_dir=not bool(keep_results),
+                    selected_features=st.session_state["selected_features"],
+                )
+            except Exception as exc:
+                st.exception(exc)
+                st.stop()
 
-    hist = results.get("history", {})
-    if hist and hist.get("train_returns"):
-        st.subheader("Training returns")
-        train_df = pd.DataFrame({"episode": list(range(1, len(hist["train_returns"]) + 1)), "return": hist["train_returns"]})
-        st.line_chart(train_df.set_index("episode"))
+        st.success("Run completed")
 
-    account_df = results.get("backtest_account")
-    if isinstance(account_df, pd.DataFrame) and not account_df.empty:
-        st.subheader("Backtest outputs")
+        st.subheader("Run summary")
+        st.write({
+            "strategy": strategy,
+            "stock_name": results["stock_name"],
+            "data_path": results["data_path"],
+            "best_model_path": results["best_model_path"],
+            "selected_features": results.get("selected_features", st.session_state["selected_features"]),
+            "validation_range": results.get("validation_range", {}),
+        })
 
-        if "Capitals" in account_df.columns:
-            cap_df = account_df[["Date", "Capitals"]].copy()
-            st.line_chart(cap_df.set_index("Date"))
+        perf = results.get("best_performance", {})
+        if perf:
+            st.subheader("Best validation metrics")
+            metric_cols = st.columns(min(4, len(perf)))
+            for idx, (k, v) in enumerate(perf.items()):
+                metric_cols[idx % len(metric_cols)].metric(k, _safe_metric_value(v))
 
-        action_col = "Action" if "Action" in account_df.columns else None
-        if action_col is not None:
-            action_counts = account_df[action_col].value_counts().rename_axis("Action").reset_index(name="Count")
-            st.dataframe(action_counts, use_container_width=True)
+        bh_perf = results.get("best_buy_hold_performance", {})
+        if bh_perf:
+            st.subheader("Buy & Hold validation metrics")
+            metric_cols = st.columns(min(4, len(bh_perf)))
+            for idx, (k, v) in enumerate(bh_perf.items()):
+                metric_cols[idx % len(metric_cols)].metric(k, _safe_metric_value(v))
 
-        output_csv = Path(results["stock_name"]) / "backtest_results.csv"
-        if output_csv.exists():
-            st.download_button(
-                "Download backtest_results.csv",
-                data=output_csv.read_bytes(),
-                file_name=output_csv.name,
-                mime="text/csv",
-            )
+        hist = results.get("history", {})
+        if hist and hist.get("train_returns"):
+            st.subheader("Training returns")
+            train_df = pd.DataFrame({"episode": list(range(1, len(hist["train_returns"]) + 1)), "return": hist["train_returns"]})
+            st.line_chart(train_df.set_index("episode"))
 
-    if use_mlflow:
-        st.info("MLflow tracked this run. To inspect locally: `mlflow ui --backend-store-uri sqlite:///mlflow.db`")
-else:
-    st.caption("Configure parameters in the sidebar and click 'Run train + backtest'.")
+        account_df = results.get("backtest_account")
+        if isinstance(account_df, pd.DataFrame) and not account_df.empty:
+            st.subheader("Backtest outputs")
+
+            if "Capitals" in account_df.columns:
+                cap_cols = ["Date", "Capitals"]
+                if "BuyHold_Capitals" in account_df.columns:
+                    cap_cols.append("BuyHold_Capitals")
+                cap_df = account_df[cap_cols].copy()
+                st.line_chart(cap_df.set_index("Date"))
+
+            if "Action" in account_df.columns:
+                events_df = account_df.loc[account_df["Action"] != 0, ["Date", "Close", "Action", "Capitals"]].copy()
+                if not events_df.empty:
+                    events_df["Action_Label"] = events_df["Action"].map({1.0: "BUY", -1.0: "SELL"})
+                    st.subheader("Buy/Sell action events")
+                    st.dataframe(events_df, width='stretch')
+
+            action_col = "Action" if "Action" in account_df.columns else None
+            if action_col is not None:
+                action_counts = account_df[action_col].value_counts().rename_axis("Action").reset_index(name="Count")
+                st.dataframe(action_counts, width='stretch')
+
+            output_csv = Path(results["stock_name"]) / "backtest_results.csv"
+            if output_csv.exists():
+                st.download_button(
+                    "Download backtest_results.csv",
+                    data=output_csv.read_bytes(),
+                    file_name=output_csv.name,
+                    mime="text/csv",
+                )
+
+            summary_csv = Path(results["stock_name"]) / "backtest_summary.csv"
+            if summary_csv.exists():
+                st.download_button(
+                    "Download backtest_summary.csv",
+                    data=summary_csv.read_bytes(),
+                    file_name=summary_csv.name,
+                    mime="text/csv",
+                )
+
+        if use_mlflow:
+            st.info("MLflow tracked this run. To inspect locally: `mlflow ui --backend-store-uri sqlite:///mlflow.db`")
+    else:
+        st.caption("Configure parameters in the sidebar, choose features in Features tab, then click 'Run train + backtest'.")

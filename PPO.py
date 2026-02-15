@@ -18,9 +18,23 @@ import shap
 import os
 import argparse
 import sys
+from pathlib import Path
 os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 warnings.filterwarnings('ignore')
+
+AVAILABLE_FEATURES = {
+    'Open': 'Open price',
+    'High': 'High price',
+    'Low': 'Low price',
+    'Close': 'Close price',
+    'Volume': 'Trading volume',
+    'MA_5': '5-day moving average of close',
+    'MA_10': '10-day moving average of close',
+    'MA_20': '20-day moving average of close',
+}
+DEFAULT_FEATURES = ['Open', 'High', 'Low', 'Close', 'Volume']
+
 # ==================== Random Seed Setup ====================
 def setup_seed(seed):
     """Set random seeds for reproducible experiments."""
@@ -33,7 +47,7 @@ def setup_seed(seed):
 # ==================== Data Preprocessing Class ====================
 class Preprocessor:
     """Preprocess raw market data and compute feature columns."""
-    def computeIndicator(self, df, start_date, end_date):
+    def computeIndicator(self, df, start_date, end_date, selected_features=None):
         """Compute indicators and return processed features with price trend data."""
         df = df[df['Volume'] != 0]  # Filter out zero-volume rows
 
@@ -49,17 +63,24 @@ class Preprocessor:
         # Compute technical indicators
         df['MA_5'] = df['Close'].rolling(5, min_periods=1).mean()   # 5-day moving average
         df['MA_10'] = df['Close'].rolling(10, min_periods=1).mean()  # 10-day moving average
+        df['MA_20'] = df['Close'].rolling(20, min_periods=1).mean()  # 20-day moving average
         df.ffill(inplace=True)  # Forward-fill missing values
 
         # Extract features and price trend
-        preprocessed_data = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-        trend = df[['Date', 'Close']].copy()
+        if selected_features is None:
+            selected_features = DEFAULT_FEATURES
+        available = [name for name in selected_features if name in df.columns]
+        if not available:
+            raise ValueError('No valid selected features were found in data.')
+
+        preprocessed_data = df[available].copy()
+        trend = df[['Date', 'Open', 'Close']].copy()
         return preprocessed_data, trend
 
 # ==================== Trading Environment Class ====================
 class TradingEnv:
     """Trading environment for policy-based reinforcement learning experiments."""
-    def __init__(self, df, startingDate, endingDate, init_money=500000):
+    def __init__(self, df, startingDate, endingDate, init_money=500000, selected_features=None):
         """Initialize the trading environment instance."""
         self.n_actions = 3       # 0: hold, 1: buy/open long, 2: sell/close long
         self.window_size = 20    # State observation window size
@@ -68,6 +89,7 @@ class TradingEnv:
         self.startingDate = startingDate  # Start date
         self.endingDate = endingDate    # End date
         self.raw_df = df.copy()
+        self.selected_features = selected_features or DEFAULT_FEATURES
 
         # Initialize market data
         self.preprocessed_market_data = None
@@ -80,9 +102,12 @@ class TradingEnv:
     def init_market_data(self):
         preprocessor = Preprocessor()
         preprocessed_data, trend_df = preprocessor.computeIndicator(
-            self.raw_df, self.startingDate, self.endingDate)
+            self.raw_df, self.startingDate, self.endingDate, selected_features=self.selected_features)
         self.preprocessed_market_data = preprocessed_data
         self.trend = trend_df['Close']
+
+        if len(self.trend) <= self.window_size + 1:
+            raise ValueError('Not enough data points for selected date range/window size.')
 
         # Account table
         self.account = trend_df.copy()
@@ -95,7 +120,7 @@ class TradingEnv:
         self.account['Returns'] = 0.0
 
         self.input_size = self.preprocessed_market_data.shape[1]
-        self.terminal_date = len(self.trend) - self.window_size - 1
+        self.terminal_date = len(self.trend) - 2
 
 
     def reset(self, startingPoint=1):
@@ -103,7 +128,8 @@ class TradingEnv:
             self.init_market_data()
         # Validate starting point
 
-        self.t = np.clip(startingPoint, self.window_size - 1, self.terminal_date - self.window_size)
+        upper_bound = max(self.window_size - 1, self.terminal_date)
+        self.t = int(np.clip(startingPoint, self.window_size - 1, upper_bound))
         # Reset account
         self.account['Position'] = 0.0 # 0: flat, 1: long
         self.account['Action'] = 0.0 # 0: hold, 1: buy, -1: sell
@@ -128,54 +154,58 @@ class TradingEnv:
         return np.ravel(state.values)
 
 
-    def buy_stock(self):
+    def buy_stock(self, idx):
         """Execute a buy action and update position state."""
         # Compute maximum buyable quantity
-        max_pos = int(self.account.loc[self.t-1, 'Cash'] / (self.account.loc[self.t, 'Close'] * (1 + self.transitionCost)))
+        max_pos = int(self.account.loc[idx - 1, 'Cash'] / (self.account.loc[idx, 'Open'] * (1 + self.transitionCost)))
         self.holdingNum = max_pos
-        self.account.loc[self.t, 'Cash'] = self.account.loc[self.t-1, 'Cash']-self.holdingNum*self.account.loc[self.t, 'Close']*(1+self.transitionCost)
+        self.account.loc[idx, 'Cash'] = self.account.loc[idx - 1, 'Cash'] - self.holdingNum * self.account.loc[idx, 'Open'] * (1 + self.transitionCost)
         # Update position state
-        self.account.loc[self.t, 'Position'] = 1.0
-        self.account.loc[self.t, 'Action'] = 1.0
+        self.account.loc[idx, 'Position'] = 1.0
+        self.account.loc[idx, 'Action'] = 1.0
 
-    def sell_stock(self):
+    def sell_stock(self, idx):
         """Execute a sell action and update cash/position state."""
 
-        self.account.loc[self.t, 'Cash'] = self.account.loc[self.t-1, 'Cash'] + self.holdingNum*self.account.loc[self.t, 'Close']*(1-self.transitionCost)
+        self.account.loc[idx, 'Cash'] = self.account.loc[idx - 1, 'Cash'] + self.holdingNum * self.account.loc[idx, 'Open'] * (1 - self.transitionCost)
 
         self.holdingNum = 0
-        self.account.loc[self.t, 'Position'] = 0
-        self.account.loc[self.t, 'Action'] = -1.0
+        self.account.loc[idx, 'Position'] = 0
+        self.account.loc[idx, 'Action'] = -1.0
 
             
-    def riskControl(self):
-        self.account.loc[self.t, 'Cash'] = self.account.loc[self.t - 1, 'Cash']
-        self.account.loc[self.t, 'Action'] = 0.0
-        self.account.loc[self.t, 'Position'] = self.account.loc[self.t - 1, 'Position']
+    def riskControl(self, idx):
+        self.account.loc[idx, 'Cash'] = self.account.loc[idx - 1, 'Cash']
+        self.account.loc[idx, 'Action'] = 0.0
+        self.account.loc[idx, 'Position'] = self.account.loc[idx - 1, 'Position']
             
 
     def step(self, action):
+        # Decide at t, execute at next bar open (t + 1) to avoid same-bar look-ahead
+        execute_idx = self.t + 1
+
         # Execute action
-        if (action == 1) and (self.account.loc[self.t-1,'Position'] == 0):
-            self.account.loc[self.t, 'Q_Action'] = 1.0
-            self.buy_stock()
-        elif action == 2 and (self.account.loc[self.t-1, 'Position'] == 1):
-            self.account.loc[self.t, 'Q_Action'] = -1.0
-            self.sell_stock()
+        if (action == 1) and (self.account.loc[execute_idx - 1, 'Position'] == 0):
+            self.account.loc[execute_idx, 'Q_Action'] = 1.0
+            self.buy_stock(execute_idx)
+        elif action == 2 and (self.account.loc[execute_idx - 1, 'Position'] == 1):
+            self.account.loc[execute_idx, 'Q_Action'] = -1.0
+            self.sell_stock(execute_idx)
         else: # No operation
-            self.account.loc[self.t, 'Q_Action'] = 0
-            self.riskControl()
+            self.account.loc[execute_idx, 'Q_Action'] = 0
+            self.riskControl(execute_idx)
         
         # Update account information
-        self.account.loc[self.t, 'Holdings'] = self.account.loc[self.t, 'Position']*self.holdingNum*self.account.loc[self.t, 'Close']
-        self.account.loc[self.t, 'Capitals'] = self.account.loc[self.t, 'Cash'] + self.account.loc[self.t, 'Holdings']
+        self.account.loc[execute_idx, 'Holdings'] = self.account.loc[execute_idx, 'Position'] * self.holdingNum * self.account.loc[execute_idx, 'Close']
+        self.account.loc[execute_idx, 'Capitals'] = self.account.loc[execute_idx, 'Cash'] + self.account.loc[execute_idx, 'Holdings']
         # Compute return rate
-        self.account.loc[self.t, 'Returns'] = (self.account.loc[self.t, 'Capitals']- self.account.loc[self.t-1, 'Capitals'])/self.account.loc[self.t-1, 'Capitals']
+        self.account.loc[execute_idx, 'Returns'] = (
+            self.account.loc[execute_idx, 'Capitals'] - self.account.loc[execute_idx - 1, 'Capitals']
+        ) / self.account.loc[execute_idx - 1, 'Capitals']
         
         # Compute reward - use immediate portfolio return
-        current_capital = self.account.loc[self.t, 'Cash'] + \
-                          self.holdingNum * self.account.loc[self.t, 'Close']
-        prev_capital = self.account.loc[self.t-1, 'Capitals']
+        current_capital = self.account.loc[execute_idx, 'Cash'] + self.holdingNum * self.account.loc[execute_idx, 'Close']
+        prev_capital = self.account.loc[execute_idx - 1, 'Capitals']
         
         # Reward = portfolio return (percentage change)
         portfolio_return = (current_capital - prev_capital) / prev_capital
@@ -187,13 +217,12 @@ class TradingEnv:
             self.reward = portfolio_return
 
         # Update time step
-        self.t += 1
+        self.t = execute_idx
         
-        done = False
-        if self.t == self.terminal_date:
-            done = True
+        done = self.t >= self.terminal_date
+        if done:
             # Clean invalid data
-            self.account = self.account.drop(index=(self.account.loc[(self.account.index>=self.t)].index))
+            self.account = self.account.drop(index=(self.account.loc[(self.account.index > self.t)].index))
         
         next_state = self.get_state(self.t)
         return next_state, self.reward, done
@@ -301,6 +330,118 @@ class PPO:
             self.critic_optimizer.step()
         transition_dict.clear()
 
+
+def cleanup_result_files(output_dir):
+    """Remove generated result artifacts from an output folder."""
+    output_path = Path(output_dir)
+    if not output_path.exists():
+        return []
+
+    patterns = [
+        'PPO_Best_*.pth',
+        'best_account_ep*.csv',
+        'train_account.csv',
+        'backtest_results.csv',
+        'action_events.csv',
+        'backtest_summary.csv',
+        'IXIC_PPO_*.png',
+        'IXIC_PPO_*.eps',
+        '*_PPO_*.png',
+        '*_PPO_*.eps',
+    ]
+
+    removed_files = []
+    for pattern in patterns:
+        for file_path in output_path.glob(pattern):
+            if file_path.is_file():
+                file_path.unlink()
+                removed_files.append(str(file_path))
+    return removed_files
+
+
+def add_buy_hold_benchmark(account_df, window_size=20):
+    """Add Buy & Hold capital/return series using evaluation start as baseline."""
+    account = account_df.copy()
+    if account.empty or 'Close' not in account.columns:
+        return account
+
+    valid_start = min(max(window_size - 1, 0), len(account) - 1)
+    start_close = float(account['Close'].iloc[valid_start])
+    start_capital = float(account['Capitals'].iloc[valid_start])
+
+    account['BuyHold_Capitals'] = np.nan
+    account['BuyHold_Returns'] = 0.0
+
+    if start_close == 0:
+        account.loc[account.index[valid_start]:, 'BuyHold_Capitals'] = start_capital
+    else:
+        scaled_close = account.loc[account.index[valid_start]:, 'Close'] / start_close
+        account.loc[account.index[valid_start]:, 'BuyHold_Capitals'] = start_capital * scaled_close
+
+    account.loc[account.index[valid_start]:, 'BuyHold_Returns'] = (
+        account.loc[account.index[valid_start]:, 'BuyHold_Capitals']
+        .pct_change()
+        .fillna(0.0)
+    )
+    return account
+
+
+def compute_buy_hold_performance(account_df, window_size=20):
+    """Compute Buy & Hold performance table from benchmark series."""
+    account = add_buy_hold_benchmark(account_df, window_size)
+    account = account.iloc[window_size - 1:].copy()
+    if account.empty:
+        return [], {}
+
+    pnl = account['BuyHold_Capitals'].iloc[-1] - account['BuyHold_Capitals'].iloc[0]
+    cr = ((account['BuyHold_Capitals'].iloc[-1] - account['BuyHold_Capitals'].iloc[0]) / account['BuyHold_Capitals'].iloc[0]) * 100
+
+    start_date = pd.to_datetime(account['Date'].iloc[0])
+    end_date = pd.to_datetime(account['Date'].iloc[-1])
+    days = max((end_date - start_date).days, 1)
+    total_return = (account['BuyHold_Capitals'].iloc[-1] - account['BuyHold_Capitals'].iloc[0]) / account['BuyHold_Capitals'].iloc[0]
+    annualized_return = 100 * ((1 + total_return) ** (365 / days) - 1)
+
+    annualized_volatility = 100 * np.sqrt(252) * account['BuyHold_Returns'].std()
+    expected_return = account['BuyHold_Returns'].mean()
+    volatility = account['BuyHold_Returns'].std()
+    sharpe_ratio = 0 if volatility == 0 else np.sqrt(252) * expected_return / volatility
+
+    downside_returns = account['BuyHold_Returns'][account['BuyHold_Returns'] < 0]
+    downside_std = downside_returns.std()
+    sortino_ratio = 0 if downside_std == 0 else np.sqrt(252) * expected_return / downside_std
+
+    capitals = account['BuyHold_Capitals'].values
+    through = np.argmax(np.maximum.accumulate(capitals) - capitals)
+    if through == 0:
+        max_dd, max_ddd = 0, 0
+    else:
+        peak = np.argmax(capitals[:through])
+        max_dd = 100 * (capitals[peak] - capitals[through]) / capitals[peak]
+        max_ddd = through - peak
+
+    metrics_dict = {
+        'PnL': float(pnl),
+        'Cummulated Return': f'{cr:.2f}%',
+        'Annualized Return': f'{annualized_return:.2f}%',
+        'Annualized Volatility': f'{annualized_volatility:.2f}%',
+        'Sharpe Ratio': float(sharpe_ratio),
+        'Sortino Ratio': float(sortino_ratio),
+        'Max Drawdown': f'{max_dd:.2f}%',
+        'Max DD Duration': f'{max_ddd} days',
+    }
+    table = [
+        ['PnL', f'{pnl:.0f}'],
+        ['Cummulated Return', f'{cr:.2f}%'],
+        ['Annualized Return', f'{annualized_return:.2f}%'],
+        ['Annualized Volatility', f'{annualized_volatility:.2f}%'],
+        ['Sharpe Ratio', f'{sharpe_ratio:.3f}'],
+        ['Sortino Ratio', f'{sortino_ratio:.3f}'],
+        ['Max Drawdown', f'{max_dd:.2f}%'],
+        ['Max DD Duration', f'{max_ddd} days'],
+    ]
+    return table, metrics_dict
+
 # ==================== Performance Evaluation & Visualization ====================
 class PerformanceEstimator:
     """Performance Estimator class implementation."""
@@ -395,15 +536,25 @@ class Visualizer:
     def __init__(self, account_df, window_size=20, stock_name='SPY'):
         self.window_size = window_size
         self.valid_start = window_size - 1  # Valid data start index
-        self.account = account_df.iloc[self.valid_start:]
+        self.account = add_buy_hold_benchmark(account_df, window_size).iloc[self.valid_start:]
         self.stock_name = stock_name
     def draw_final(self):
         """Plot and save the equity curve."""
         plt.clf()
-        plt.plot(self.account['Capitals'], label='PPO')
+        x_axis = pd.to_datetime(self.account['Date'])
+        plt.plot(x_axis, self.account['Capitals'], label='PPO Capitals')
+        if 'BuyHold_Capitals' in self.account.columns:
+            plt.plot(x_axis, self.account['BuyHold_Capitals'], label='Buy & Hold Capitals', linestyle='--')
+
+        buy_mask = self.account['Action'] == 1.0
+        sell_mask = self.account['Action'] == -1.0
+        plt.scatter(x_axis[buy_mask], self.account.loc[buy_mask, 'Capitals'], marker='^', s=36, color='green', label='Buy')
+        plt.scatter(x_axis[sell_mask], self.account.loc[sell_mask, 'Capitals'], marker='v', s=36, color='red', label='Sell')
+
         plt.grid()
-        plt.xlabel('Time Step')
+        plt.xlabel('Date')
         plt.ylabel('Capitals')
+        plt.xticks(rotation=30)
         plt.legend()
         plt.savefig(f'{self.stock_name}/IXIC_PPO_Capitals.eps', format='eps', dpi=1000, bbox_inches='tight')
         plt.savefig(f'{self.stock_name}/IXIC_PPO_Capitals.png', dpi=1000, bbox_inches='tight')
@@ -412,20 +563,22 @@ class Visualizer:
     def draw(self):
         """Plot and save buy/sell trading signals."""
         fig, ax1 = plt.subplots(figsize=(12, 5))
-        ax1.plot(self.account['Close'], color='royalblue', lw=0.5, label='Price')
-        ax1.plot(self.account.loc[self.account['Action'] == 1.0].index,
-                 self.account['Close'][self.account['Action'] == 1.0], '^', markersize=6, color='green', label='Buy')
-        ax1.plot(self.account.loc[self.account['Action'] == -1.0].index,
-                 self.account['Close'][self.account['Action'] == -1.0], 'v', markersize=6, color='red', label='Sell')
-        ax1.set_xlabel('Time Step')
+        x_axis = pd.to_datetime(self.account['Date'])
+        ax1.plot(x_axis, self.account['Close'], color='royalblue', lw=0.8, label='Market Price')
+        ax1.plot(x_axis[self.account['Action'] == 1.0],
+                 self.account.loc[self.account['Action'] == 1.0, 'Close'], '^', markersize=6, color='green', label='Buy')
+        ax1.plot(x_axis[self.account['Action'] == -1.0],
+                 self.account.loc[self.account['Action'] == -1.0, 'Close'], 'v', markersize=6, color='red', label='Sell')
+        ax1.set_xlabel('Date')
         ax1.set_ylabel('Close Price')
+        ax1.tick_params(axis='x', rotation=30)
         ax1.legend(loc='upper center', ncol=3, frameon=False)
         plt.savefig(f'{self.stock_name}/IXIC_PPO_Actions.eps', format='eps', dpi=1000, bbox_inches='tight')
         plt.savefig(f'{self.stock_name}/IXIC_PPO_Actions.png', dpi=1000, bbox_inches='tight')
         plt.show()
 
 # ==================== Training Pipeline ====================
-def train_with_validation(train_env, test_env, agent, num_episodes=800, test_interval=10, stock_name='SPY', draw_plots=True):
+def train_with_validation(train_env, val_env, agent, num_episodes=800, test_interval=10, stock_name='SPY', draw_plots=True):
     """Train the agent and periodically validate on the test environment."""
     history = {
         'train_returns': [],
@@ -436,6 +589,7 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
     }
     best_pnl = -np.inf # Track best test PnL
     bestModelDir = []
+    best_buy_hold_perf = {}
 
     for i_episode in tqdm(range(num_episodes), desc='Training'):
         # Training phase
@@ -470,16 +624,16 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
 
         # Periodic validation
         if (i_episode + 1) >= test_interval:
-            test_env.init_market_data()  # Ensure each test uses an independent environment
-            state = test_env.reset()
+            val_env.init_market_data()  # Ensure each validation run uses an independent environment
+            state = val_env.reset()
             done = False
             while not done:
                 action = agent.take_action(state, greedy=True)
-                next_state, _, done = test_env.step(action)
+                next_state, _, done = val_env.step(action)
                 state = next_state
 
             # Performance evaluation
-            est = PerformanceEstimator(test_env.account, test_env.window_size)
+            est = PerformanceEstimator(val_env.account, val_env.window_size)
             est.computePerformance()
             history['test_pnl'].append(est.PnL)
             history['test_returns'].append(est.CR)
@@ -490,17 +644,28 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
             if est.PnL > best_pnl:
                 best_pnl = est.PnL
                 best_perf = est.computePerformance()
+                _, best_buy_hold_perf = compute_buy_hold_performance(val_env.account, val_env.window_size)
                 torch.save(agent.actor.state_dict(), '{}/PPO_Best_{}.pth'.format(stock_name, i_episode+1))
                 bestModelDir.append('{}/PPO_Best_{}.pth'.format(stock_name, i_episode+1))
-                test_env.account.to_csv(f'{stock_name}/best_account_ep{i_episode+1}_pnl{best_pnl:.0f}.csv', index=False)
+                best_account = add_buy_hold_benchmark(val_env.account, val_env.window_size)
+                best_account['Buy_Marker'] = (best_account['Action'] == 1.0).astype(int)
+                best_account['Sell_Marker'] = (best_account['Action'] == -1.0).astype(int)
+                best_account.to_csv(f'{stock_name}/best_account_ep{i_episode+1}_pnl{best_pnl:.0f}.csv', index=False)
     if draw_plots:
-        dra = Visualizer(test_env.account, test_env.window_size, stock_name)
+        dra = Visualizer(val_env.account, val_env.window_size, stock_name)
         dra.draw()
-    train_env.account.to_csv(f'{stock_name}/train_account.csv', index=False)
+    train_account = add_buy_hold_benchmark(train_env.account, train_env.window_size)
+    train_account['Buy_Marker'] = (train_account['Action'] == 1.0).astype(int)
+    train_account['Sell_Marker'] = (train_account['Action'] == -1.0).astype(int)
+    train_account.to_csv(f'{stock_name}/train_account.csv', index=False)
     print(f'Training complete. Best test-set PnL: {best_pnl:.2f}')
     print("\n" + "="*40 + " Validation Backtest Results " + "="*40)
     output_table = tabulate(best_perf, headers=['Metric', 'Value'], tablefmt='fancy_grid')
     print(output_table)
+    if best_buy_hold_perf:
+        print("\n" + "="*40 + " Buy & Hold (Validation Start Baseline) " + "="*40)
+        buy_hold_output = tabulate([[k, v] for k, v in best_buy_hold_perf.items()], headers=['Metric', 'Value'], tablefmt='fancy_grid')
+        print(buy_hold_output)
     # Write to txt file
     # with open('output.txt', 'w', encoding='utf-8') as f:
     #     f.write(output_table)
@@ -514,7 +679,7 @@ def train_with_validation(train_env, test_env, agent, num_episodes=800, test_int
         df1.to_csv(save_csv_name, index=False, mode='a', header=False)
     else:
         df1.to_csv(save_csv_name, index=False)
-    return history, bestModelDir[-1], performance_dict
+    return history, bestModelDir[-1], performance_dict, best_buy_hold_perf
 
 # ==================== Backtest Function ====================
 def backtest(
@@ -558,11 +723,18 @@ def backtest(
         state = next_state
     
     # Performance evaluation
+    env.account = add_buy_hold_benchmark(env.account, env.window_size)
+    env.account['Buy_Marker'] = (env.account['Action'] == 1.0).astype(int)
+    env.account['Sell_Marker'] = (env.account['Action'] == -1.0).astype(int)
+
     estimator = PerformanceEstimator(env.account, env.window_size)
     estimator.computePerformance()
     perf_table = estimator.computePerformance()
+    buy_hold_table, buy_hold_metrics = compute_buy_hold_performance(env.account, env.window_size)
     print("\n" + "="*40 + " Backtest Results " + "="*40)
     print(tabulate(perf_table, headers=['Metric', 'Value'], tablefmt='fancy_grid'))
+    print("\n" + "="*40 + " Buy & Hold Comparison (Backtest Start Baseline) " + "="*40)
+    print(tabulate(buy_hold_table, headers=['Metric', 'Value'], tablefmt='fancy_grid'))
     
     # Visualize results
     if visualize:
@@ -572,6 +744,16 @@ def backtest(
     
     # Save detailed trade records
     env.account.to_csv(f'{stock_name}/backtest_results.csv', index=False)
+    action_events = env.account.loc[env.account['Action'] != 0, ['Date', 'Close', 'Action', 'Capitals']].copy()
+    action_events['Action_Label'] = action_events['Action'].map({1.0: 'BUY', -1.0: 'SELL'})
+    action_events.to_csv(f'{stock_name}/action_events.csv', index=False)
+
+    summary_df = pd.DataFrame({
+        'Metric': [k for k, _ in perf_table] + [f'BuyHold {k}' for k, _ in buy_hold_table],
+        'Value': [v for _, v in perf_table] + [v for _, v in buy_hold_table]
+    })
+    summary_df.to_csv(f'{stock_name}/backtest_summary.csv', index=False)
+
     # Additional analysis
     print("\n" + "="*40 + " Trade Analysis " + "="*40)
     print(f"Total number of trades: {len(env.account[env.account['Action'] != 0])}")
@@ -579,7 +761,7 @@ def backtest(
     print(f"Maximum single-day loss: {env.account['Returns'].min()*100:.2f}%")
     print(f"Winning trade ratio: {len(env.account[env.account['Returns'] > 0])/len(env.account)*100:.1f}%")
     
-    return env.account, perf_table
+    return env.account, perf_table, buy_hold_metrics
     
 def run_ppo_experiment(
     stock_name='SPY',
@@ -602,7 +784,9 @@ def run_ppo_experiment(
     use_mlflow=False,
     mlflow_tracking_uri='sqlite:///mlflow.db',
     mlflow_experiment='rl-learningalgos',
-    draw_plots=True
+    draw_plots=True,
+    clean_output_dir=True,
+    selected_features=None
 ):
     setup_seed(seed)
     data_path = data_file_path or f'Data/{stock_name}.csv'
@@ -613,17 +797,64 @@ def run_ppo_experiment(
 
     if not os.path.exists(stock_name):
         os.mkdir(stock_name)
+    elif clean_output_dir:
+        removed = cleanup_result_files(stock_name)
+        if removed:
+            print(f'Cleaned {len(removed)} previous result files from {stock_name}.')
 
     train_startingDate = datetime.strptime(train_start, '%Y-%m-%d')
     train_endingDate = datetime.strptime(train_end, '%Y-%m-%d')
     test_startingDate = datetime.strptime(test_start, '%Y-%m-%d')
     test_endingDate = datetime.strptime(test_end, '%Y-%m-%d')
 
+    if selected_features is None:
+        selected_features = DEFAULT_FEATURES
+    selected_features = [feature for feature in selected_features if feature in AVAILABLE_FEATURES]
+    if not selected_features:
+        raise ValueError('At least one valid feature must be selected.')
+
+    train_window_df = df_raw.loc[
+        (pd.to_datetime(df_raw['Date']) >= train_startingDate)
+        & (pd.to_datetime(df_raw['Date']) <= train_endingDate)
+    ].copy()
+    if len(train_window_df) < 60:
+        raise ValueError('Training window too small to create train/validation split.')
+
+    split_idx = int(len(train_window_df) * 0.8)
+    split_idx = min(max(split_idx, 40), len(train_window_df) - 20)
+    split_date = pd.to_datetime(train_window_df['Date'].iloc[split_idx]).to_pydatetime()
+    train_endingDate_effective = pd.to_datetime(train_window_df['Date'].iloc[split_idx - 1]).to_pydatetime()
+
+    print(
+        f'Bias-safe split enabled: train={train_startingDate.date()}..{train_endingDate_effective.date()}, '
+        f'validation={split_date.date()}..{train_endingDate.date()}, test={test_startingDate.date()}..{test_endingDate.date()}'
+    )
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    env_train = TradingEnv(df_raw, train_startingDate, train_endingDate, init_money=init_money)
+    env_train = TradingEnv(
+        df_raw,
+        train_startingDate,
+        train_endingDate_effective,
+        init_money=init_money,
+        selected_features=selected_features
+    )
     env_train.init_market_data()
-    env_test = TradingEnv(df_raw, test_startingDate, test_endingDate, init_money=init_money)
+    env_val = TradingEnv(
+        df_raw,
+        split_date,
+        train_endingDate,
+        init_money=init_money,
+        selected_features=selected_features
+    )
+    env_val.init_market_data()
+    env_test = TradingEnv(
+        df_raw,
+        test_startingDate,
+        test_endingDate,
+        init_money=init_money,
+        selected_features=selected_features
+    )
     env_test.init_market_data()
 
     agent = PPO(
@@ -654,6 +885,9 @@ def run_ppo_experiment(
                 'data_path': data_path,
                 'train_start': train_start,
                 'train_end': train_end,
+                'train_end_effective': train_endingDate_effective.strftime('%Y-%m-%d'),
+                'val_start': split_date.strftime('%Y-%m-%d'),
+                'val_end': train_endingDate.strftime('%Y-%m-%d'),
                 'test_start': test_start,
                 'test_end': test_end,
                 'init_money': init_money,
@@ -667,15 +901,16 @@ def run_ppo_experiment(
                 'test_interval': test_interval,
                 'num_episodes': num_episodes,
                 'seed': seed,
-                'device': str(device)
+                'device': str(device),
+                'selected_features': ','.join(selected_features)
             })
         except Exception as exc:
             print(f'[WARN] MLflow initialization failed: {exc}')
 
     try:
-        history, best_model_path, best_perf_dict = train_with_validation(
+        history, best_model_path, best_perf_dict, best_buy_hold_perf = train_with_validation(
             env_train,
-            env_test,
+            env_val,
             agent,
             num_episodes=num_episodes,
             test_interval=test_interval,
@@ -683,7 +918,7 @@ def run_ppo_experiment(
             draw_plots=draw_plots
         )
 
-        account_df, performance = backtest(
+        account_df, performance, backtest_buy_hold_performance = backtest(
             best_model_path,
             env_test,
             greedy=True,
@@ -712,6 +947,8 @@ def run_ppo_experiment(
             mlflow_client.log_artifact(best_model_path)
             mlflow_client.log_artifact(f'{stock_name}/train_account.csv')
             mlflow_client.log_artifact(f'{stock_name}/backtest_results.csv')
+            mlflow_client.log_artifact(f'{stock_name}/action_events.csv')
+            mlflow_client.log_artifact(f'{stock_name}/backtest_summary.csv')
 
         return {
             'stock_name': stock_name,
@@ -720,7 +957,14 @@ def run_ppo_experiment(
             'history': history,
             'backtest_account': account_df,
             'performance_table': performance,
-            'best_performance': best_perf_dict
+            'best_performance': best_perf_dict,
+            'best_buy_hold_performance': best_buy_hold_perf,
+            'backtest_buy_hold_performance': backtest_buy_hold_performance,
+            'selected_features': selected_features,
+            'validation_range': {
+                'start': split_date.strftime('%Y-%m-%d'),
+                'end': train_endingDate.strftime('%Y-%m-%d')
+            }
         }
     finally:
         if mlflow_run is not None:
@@ -753,6 +997,8 @@ def _build_arg_parser():
     parser.add_argument('--mlflow_uri', default='sqlite:///mlflow.db', help='MLflow tracking URI')
     parser.add_argument('--mlflow_experiment', default='rl-learningalgos', help='MLflow experiment name')
     parser.add_argument('--no_plots', action='store_true', help='Disable matplotlib display and plotting')
+    parser.add_argument('--keep_results', action='store_true', help='Keep existing result artifacts in output folder')
+    parser.add_argument('--features', default=','.join(DEFAULT_FEATURES), help='Comma-separated feature list')
     return parser
 
 
@@ -782,5 +1028,7 @@ if __name__ == '__main__':
         use_mlflow=args.use_mlflow,
         mlflow_tracking_uri=args.mlflow_uri,
         mlflow_experiment=args.mlflow_experiment,
-        draw_plots=not args.no_plots
+        draw_plots=not args.no_plots,
+        clean_output_dir=not args.keep_results,
+        selected_features=[feature.strip() for feature in args.features.split(',') if feature.strip()]
     )
